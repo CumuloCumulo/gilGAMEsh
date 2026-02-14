@@ -822,6 +822,7 @@ function replaceVideoPlaceholders(markdown, videos) {
 
 /**
  * Download video file to vault
+ * Uses background script to bypass CORS restrictions
  * @param {string} url - Video URL
  * @param {string} filename - Target filename
  * @returns {Promise<Blob>}
@@ -831,14 +832,62 @@ async function downloadVideoToVault(url, filename) {
   console.log(`[Download] URL: ${url.substring(0, 100)}...`);
   
   const startTime = Date.now();
-  const response = await fetch(url);
   
-  if (!response.ok) {
-    console.error(`[Download] ✗ 下载失败 ${filename}: ${response.status} ${response.statusText}`);
-    throw new Error(`Failed to download video: ${response.statusText}`);
-  }
+  // Use Port connection for chunked transfer (bypasses CORS and message size limit)
+  const blob = await new Promise((resolve, reject) => {
+    const port = chrome.runtime.connect({ name: 'videoDownload' });
+    
+    let totalSize = 0;
+    let totalChunks = 0;
+    let mimeType = 'video/mp4';
+    const chunks = [];
+    
+    port.onMessage.addListener((msg) => {
+      if (msg.type === 'meta') {
+        totalSize = msg.totalSize;
+        totalChunks = msg.totalChunks;
+        mimeType = msg.mimeType || 'video/mp4';
+        console.log(`[Download] 接收元数据: ${(totalSize / 1024 / 1024).toFixed(2)}MB, ${totalChunks} 个分块`);
+      
+      } else if (msg.type === 'chunk') {
+        // Decode Base64 chunk back to Uint8Array
+        const binary = atob(msg.data);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        chunks[msg.index] = bytes;
+        console.log(`[Download] 分块 ${msg.index + 1}/${totalChunks} 已接收 (${(bytes.length / 1024 / 1024).toFixed(2)}MB)`);
+      
+      } else if (msg.type === 'done') {
+        port.disconnect();
+        // Reassemble all chunks into a single Blob
+        const allChunks = [];
+        for (let i = 0; i < totalChunks; i++) {
+          if (chunks[i]) {
+            allChunks.push(chunks[i]);
+          }
+        }
+        const resultBlob = new Blob(allChunks, { type: mimeType });
+        console.log(`[Download] ✓ 所有分块接收完毕，总大小: ${(resultBlob.size / 1024 / 1024).toFixed(2)}MB`);
+        resolve(resultBlob);
+      
+      } else if (msg.type === 'error') {
+        port.disconnect();
+        reject(new Error(msg.error));
+      }
+    });
+    
+    port.onDisconnect.addListener(() => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+      }
+    });
+    
+    // Request download
+    port.postMessage({ action: 'downloadVideo', url: url });
+  });
   
-  const blob = await response.blob();
   const downloadTime = Date.now() - startTime;
   const sizeMB = (blob.size / 1024 / 1024).toFixed(2);
   
@@ -954,7 +1003,8 @@ async function handleExportToObsidian() {
     await saveFileToVault(mdFilename, mdBlob);
     console.log(`[Main] ✓ Markdown saved: ${mdFilename}`);
 
-    // Step 6: Download and save videos
+    // Step 6: Download and save videos (with error tolerance)
+    const videoResults = [];
     if (videos.length > 0) {
       console.log(`[Main] === Step 6: 下载并保存 ${videos.length} 个视频 ===`);
       showStatus(`正在下载 ${videos.length} 个视频...`);
@@ -964,20 +1014,36 @@ async function handleExportToObsidian() {
         console.log(`[Main] 处理视频 ${i + 1}/${videos.length}: ${video.id}`);
         showStatus(`正在下载视频 ${i + 1}/${videos.length}...`);
 
-        const blob = await downloadVideoToVault(video.url, `${video.id}.mp4`);
-        await saveFileToVault(`videos/${video.id}.mp4`, blob);
-        console.log(`[Main] ✓ Video ${i + 1}/${videos.length} saved: videos/${video.id}.mp4`);
+        try {
+          const blob = await downloadVideoToVault(video.url, `${video.id}.mp4`);
+          await saveFileToVault(`videos/${video.id}.mp4`, blob);
+          console.log(`[Main] ✓ Video ${i + 1}/${videos.length} saved: videos/${video.id}.mp4`);
+          videoResults.push({ id: video.id, success: true });
+        } catch (error) {
+          console.error(`[Main] ✗ 视频 ${i + 1}/${videos.length} 下载失败 (${video.id}):`, error.message);
+          videoResults.push({ id: video.id, success: false, error: error.message });
+          // 继续下载下一个视频，不中断整个导出流程
+        }
       }
     }
 
+    const failedVideos = videoResults.filter(r => !r.success);
+    const succeededVideos = videoResults.filter(r => r.success);
     const totalTime = ((Date.now() - overallStartTime) / 1000).toFixed(1);
     console.log('========================================');
     console.log(`[Main] ✓✓✓ 导出完成！总耗时: ${totalTime}秒`);
     console.log(`[Main] 文件位置: ${mdFilename}`);
-    console.log(`[Main] 视频数量: ${videos.length}`);
+    console.log(`[Main] 视频: ${succeededVideos.length}/${videos.length} 成功`);
+    if (failedVideos.length > 0) {
+      console.warn(`[Main] ✗ ${failedVideos.length} 个视频下载失败:`, failedVideos.map(v => v.id).join(', '));
+    }
     console.log('========================================');
     
-    showStatus(`导出完成！已保存到Obsidian仓库: ${mdFilename}`, false);
+    if (failedVideos.length > 0) {
+      showStatus(`导出完成！已保存: ${mdFilename}（${failedVideos.length}个视频下载失败）`, false);
+    } else {
+      showStatus(`导出完成！已保存到Obsidian仓库: ${mdFilename}`, false);
+    }
 
   } catch (error) {
     console.error('========================================');

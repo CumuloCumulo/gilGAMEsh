@@ -9,6 +9,9 @@
 - 📁 **直接保存**：使用 File System Access API 直接保存到 Obsidian 仓库
 - 🔄 **完整迁移**：Markdown 文档 + 视频文件 + 目录结构一次性完成
 - 📊 **详细日志**：每个步骤都有详细的日志输出，方便排查问题
+- 🛡️ **容错机制**：单个视频下载失败不影响其他视频和整体导出流程
+- 📡 **跨域下载**：通过 Background Script 绕过 CORS 限制，支持阿里云 OSS、淘宝 CDN 等视频源
+- 📦 **大文件支持**：使用 Port 分块传输，突破 Chrome 64MiB 消息大小限制，支持任意大小视频
 
 ## 🎯 解决的问题
 
@@ -98,7 +101,8 @@ Markdown 中的视频占位符已被替换为：
 - **File System Access API**：直接访问本地文件系统，无需下载管理
 - **Chrome Downloads API**：监听浏览器下载事件
 - **DOM 自动化**：模拟用户操作，自动化导出流程
-- **消息传递**：Background Script 和 Content Script 通信
+- **Port 分块传输**：通过 `chrome.runtime.connect()` 建立长连接，将视频数据分块（4MB/块）传输，突破消息大小限制
+- **Background Script 代理下载**：在 Background Service Worker 中执行 fetch 请求，绕过 Content Script 的 CORS 限制
 
 ### 工作流程
 
@@ -131,11 +135,15 @@ Markdown 中的视频占位符已被替换为：
         ↓
 13. 保存 Markdown 到 Obsidian
         ↓
-14. 逐个下载视频文件
+14. 逐个下载视频文件（通过 Background Script 代理，绕过 CORS）
         ↓
-15. 保存视频到 videos/ 目录
+15. 通过 Port 分块传输视频数据（4MB/块，Base64 编码）
         ↓
-✅ 完成
+16. Content Script 接收并拼装视频文件
+        ↓
+17. 保存视频到 videos/ 目录（单个失败不中断流程）
+        ↓
+✅ 完成（汇总报告成功/失败数量）
 ```
 
 ### 关键挑战与解决方案
@@ -147,6 +155,9 @@ Markdown 中的视频占位符已被替换为：
 | Content Script 无法直接访问 Downloads API | 通过消息传递与 Background Script 通信 |
 | 视频 URL 带认证参数，有时效性 | 立即下载，不延迟处理 |
 | File System Access API 权限持久化 | 使用 IndexedDB 保存文件句柄 |
+| 视频托管在第三方 CDN（阿里云 OSS / 淘宝），Content Script 受 CORS 限制 | 通过 Background Script 代理下载，配合 `host_permissions` 声明跨域权限 |
+| Chrome 消息传递有 64MiB 大小限制，大视频无法通过 `sendResponse` 返回 | 使用 `chrome.runtime.connect()` Port 长连接分块传输（4MB/块，Base64 编码） |
+| 单个视频下载失败导致整个导出流程中断 | 为每个视频下载添加 try/catch 容错，失败后继续处理剩余视频 |
 
 ## 🐛 常见问题
 
@@ -186,13 +197,26 @@ Markdown 中的视频占位符已被替换为：
 ### Q4: 视频没有下载？
 
 **可能原因：**
-- 视频链接已过期
+- 视频链接已过期（OSS 签名 URL 有时效限制）
 - 网络问题
+- CDN 服务器临时故障
 
 **解决方法：**
-1. 查看控制台日志，确认是否找到视频
-2. 检查 `[Video]` 标签的日志输出
-3. 手动在语雀页面右键视频保存
+1. **刷新语雀页面**重新获取新的签名 URL，然后再次导出
+2. 查看控制台日志，确认是否找到视频
+3. 检查 `[Download]` 和 `[Background]` 标签的日志输出
+4. 注意：单个视频下载失败不会影响其他视频，失败的视频会在导出完成后汇总提示
+
+### Q6: 提示"Download failed"或视频下载失败？
+
+**可能原因：**
+- 视频 OSS 签名过期（`AccessDenied` 错误）
+- CDN 连接被关闭（`ERR_CONNECTION_CLOSED`）
+
+**解决方法：**
+1. 刷新语雀页面，让页面重新生成带有效签名的视频 URL
+2. 重新点击导出按钮
+3. 如果某个视频持续失败，可能是 CDN 服务端问题，稍后重试
 
 ### Q5: 提示"语雀导出为ZIP格式"？
 
@@ -211,7 +235,8 @@ Markdown 中的视频占位符已被替换为：
 
 - `[Main]` - 主导出流程
 - `[Export]` - 语雀自动导出
-- `[Download]` - 浏览器下载监听
+- `[Download]` - 视频下载（分块传输进度）
+- `[Background]` - Background Script（视频代理下载、分块发送）
 - `[Video]` - 视频收集
 - `[Replace]` - 内容替换
 - `[Save]` - 文件保存
@@ -231,8 +256,15 @@ Markdown 中的视频占位符已被替换为：
 [Video] ✓ 收集完成，共 5 个有效视频
 [Replace] ✓ 替换完成，共替换 5/5 个占位符
 [Save] ✓ 文件已保存: 庄永琪.md
-[Download] ✓ 下载完成: SB2px.mp4, 大小: 12.34MB
+[Download] 接收元数据: 12.34MB, 4 个分块
+[Download] 分块 1/4 已接收 (4.00MB)
+[Download] 分块 2/4 已接收 (4.00MB)
+[Download] 分块 3/4 已接收 (4.00MB)
+[Download] 分块 4/4 已接收 (0.34MB)
+[Download] ✓ 所有分块接收完毕，总大小: 12.34MB
+[Download] ✓ 下载完成: SB2px.mp4, 大小: 12.34MB, 耗时: 2340ms
 [Main] ✓✓✓ 导出完成！总耗时: 15.6秒
+[Main] 视频: 5/5 成功
 ```
 
 ## 🛠️ 开发说明
